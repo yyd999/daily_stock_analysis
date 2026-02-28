@@ -82,7 +82,7 @@ class Config:
     openai_model: str = "gpt-4o-mini"  # OpenAI 兼容模型名称
     openai_vision_model: Optional[str] = None  # Vision 专用模型（可选，不配置则用 openai_model；部分模型如 DeepSeek 不支持图像）
     openai_temperature: float = 0.7  # OpenAI 温度参数（0.0-2.0，默认0.7）
-    
+
     # === 搜索引擎配置（支持多 Key 负载均衡）===
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
@@ -92,6 +92,12 @@ class Config:
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
+
+    # === Agent 模式配置 ===
+    agent_mode: bool = False
+    agent_max_steps: int = 10
+    agent_skills: List[str] = field(default_factory=list)
+    agent_strategy_dir: Optional[str] = None
 
     # === 通知配置（可同时配置多个，全部推送）===
     
@@ -146,6 +152,7 @@ class Config:
 
     # PushPlus 推送配置
     pushplus_token: Optional[str] = None  # PushPlus Token
+    pushplus_topic: Optional[str] = None  # PushPlus 群组编码（一对多推送）
 
     # Server酱3 推送配置
     serverchan3_sendkey: Optional[str] = None  # Server酱3 SendKey
@@ -159,6 +166,7 @@ class Config:
     # 消息长度限制（字节）- 超长自动分批发送
     feishu_max_bytes: int = 20000  # 飞书限制约 20KB，默认 20000 字节
     wechat_max_bytes: int = 4000   # 企业微信限制 4096 字节，默认 4000 字节
+    discord_max_words: int = 2000  # Discord 限制 2000 字，默认 2000 字
     wechat_msg_type: str = "markdown"  # 企业微信消息类型，默认 markdown 类型
 
     # Markdown 转图片（Issue #289）：对不支持 Markdown 的渠道以图片发送
@@ -192,11 +200,18 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
+    run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
+    # 大盘复盘市场区域：cn(A股)、us(美股)、both(两者)，us 适合仅关注美股的用户
+    market_review_region: str = "cn"
+    # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
+    trading_day_check_enabled: bool = True
 
     # === 实时行情增强数据配置 ===
     # 实时行情开关（关闭后使用历史收盘价进行分析）
     enable_realtime_quote: bool = True
+    # 盘中实时技术面：启用时用实时价计算 MA/多头排列（Issue #234）；关闭则用昨日收盘
+    enable_realtime_technical_indicators: bool = True
     # 筹码分布开关（该接口不稳定，云端部署建议关闭）
     enable_chip_distribution: bool = True
     # 东财接口补丁开关
@@ -335,12 +350,12 @@ class Config:
                 os.environ['https_proxy'] = https_proxy
 
         
-        # 解析自选股列表（逗号分隔）
+        # 解析自选股列表（逗号分隔，统一为大写 Issue #355）
         stock_list_str = os.getenv('STOCK_LIST', '')
         stock_list = [
-            code.strip() 
-            for code in stock_list_str.split(',') 
-            if code.strip()
+            (c or "").strip().upper()
+            for c in stock_list_str.split(',')
+            if (c or "").strip()
         ]
         
         # 如果没有配置，使用默认的示例股票
@@ -387,8 +402,16 @@ class Config:
             anthropic_model=os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022'),
             anthropic_temperature=float(os.getenv('ANTHROPIC_TEMPERATURE', '0.7')),
             anthropic_max_tokens=int(os.getenv('ANTHROPIC_MAX_TOKENS', '8192')),
-            openai_api_key=os.getenv('OPENAI_API_KEY'),
-            openai_base_url=os.getenv('OPENAI_BASE_URL'),
+            # AIHubmix is the preferred OpenAI-compatible provider (one key, all models, no VPN required).
+            # Within the OpenAI-compatible layer: AIHUBMIX_KEY takes priority over OPENAI_API_KEY.
+            # Overall provider fallback order: Gemini > Anthropic > OpenAI-compatible (incl. AIHubmix).
+            # base_url is auto-set to aihubmix.com/v1 when AIHUBMIX_KEY is used and no explicit
+            # OPENAI_BASE_URL override is provided.
+            # Model names match upstream (e.g. gemini-3.1-pro-preview, gpt-4o, gpt-4o-free, deepseek-chat).
+            openai_api_key=os.getenv('AIHUBMIX_KEY') or os.getenv('OPENAI_API_KEY') or None,
+            openai_base_url=os.getenv('OPENAI_BASE_URL') or (
+                'https://aihubmix.com/v1' if os.getenv('AIHUBMIX_KEY') else None
+            ),  # noqa: E501
             openai_model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
             openai_vision_model=os.getenv('OPENAI_VISION_MODEL') or None,
             openai_temperature=float(os.getenv('OPENAI_TEMPERATURE', '0.7')),
@@ -398,6 +421,10 @@ class Config:
             serpapi_keys=serpapi_keys,
             news_max_age_days=max(1, int(os.getenv('NEWS_MAX_AGE_DAYS', '3'))),
             bias_threshold=max(1.0, float(os.getenv('BIAS_THRESHOLD', '5.0'))),
+            agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
+            agent_max_steps=int(os.getenv('AGENT_MAX_STEPS', '10')),
+            agent_skills=[s.strip() for s in os.getenv('AGENT_SKILLS', '').split(',') if s.strip()],
+            agent_strategy_dir=os.getenv('AGENT_STRATEGY_DIR'),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -411,6 +438,7 @@ class Config:
             pushover_user_key=os.getenv('PUSHOVER_USER_KEY'),
             pushover_api_token=os.getenv('PUSHOVER_API_TOKEN'),
             pushplus_token=os.getenv('PUSHPLUS_TOKEN'),
+            pushplus_topic=os.getenv('PUSHPLUS_TOPIC'),
             serverchan3_sendkey=os.getenv('SERVERCHAN3_SENDKEY'),
             custom_webhook_urls=[u.strip() for u in os.getenv('CUSTOM_WEBHOOK_URLS', '').split(',') if u.strip()],
             custom_webhook_bearer_token=os.getenv('CUSTOM_WEBHOOK_BEARER_TOKEN'),
@@ -428,6 +456,7 @@ class Config:
             feishu_max_bytes=int(os.getenv('FEISHU_MAX_BYTES', '20000')),
             wechat_max_bytes=wechat_max_bytes,
             wechat_msg_type=wechat_msg_type_lower,
+            discord_max_words=int(os.getenv('DISCORD_MAX_WORDS', '2000')),
             markdown_to_image_channels=[
                 c.strip().lower()
                 for c in os.getenv('MARKDOWN_TO_IMAGE_CHANNELS', '').split(',')
@@ -450,7 +479,12 @@ class Config:
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
             schedule_run_immediately=os.getenv('SCHEDULE_RUN_IMMEDIATELY', 'true').lower() == 'true',
+            run_immediately=os.getenv('RUN_IMMEDIATELY', 'true').lower() == 'true',
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
+            market_review_region=cls._parse_market_review_region(
+                os.getenv('MARKET_REVIEW_REGION', 'cn')
+            ),
+            trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=int(os.getenv('WEBUI_PORT', '8000')),
@@ -479,6 +513,9 @@ class Config:
             discord_bot_status=os.getenv('DISCORD_BOT_STATUS', 'A股智能分析 | /help'),
             # 实时行情增强数据配置
             enable_realtime_quote=os.getenv('ENABLE_REALTIME_QUOTE', 'true').lower() == 'true',
+            enable_realtime_technical_indicators=os.getenv(
+                'ENABLE_REALTIME_TECHNICAL_INDICATORS', 'true'
+            ).lower() == 'true',
             enable_chip_distribution=os.getenv('ENABLE_CHIP_DISTRIBUTION', 'true').lower() == 'true',
             # 东财接口补丁开关
             enable_eastmoney_patch=os.getenv('ENABLE_EASTMONEY_PATCH', 'false').lower() == 'true',
@@ -518,6 +555,18 @@ class Config:
             if 'stocks' in g and 'emails' in g and g['stocks'] and g['emails']:
                 result.append((g['stocks'], g['emails']))
         return result
+
+    @classmethod
+    def _parse_market_review_region(cls, value: str) -> str:
+        """解析大盘复盘市场区域，非法值记录警告后回退为 cn"""
+        import logging
+        v = (value or 'cn').strip().lower()
+        if v in ('cn', 'us', 'both'):
+            return v
+        logging.getLogger(__name__).warning(
+            f"MARKET_REVIEW_REGION 配置值 '{value}' 无效，已回退为默认值 'cn'（合法值：cn / us / both）"
+        )
+        return 'cn'
 
     @classmethod
     def _resolve_realtime_source_priority(cls) -> str:
@@ -577,12 +626,12 @@ class Config:
             stock_list_str = os.getenv('STOCK_LIST', '')
 
         stock_list = [
-            code.strip()
-            for code in stock_list_str.split(',')
-            if code.strip()
+            (c or "").strip().upper()
+            for c in stock_list_str.split(',')
+            if (c or "").strip()
         ]
 
-        if not stock_list:        
+        if not stock_list:
             stock_list = ['000001']
 
         self.stock_list = stock_list

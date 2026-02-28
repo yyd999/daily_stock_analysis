@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from json_repair import repair_json
 
+from src.agent.llm_adapter import get_thinking_extra_body
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -603,7 +604,7 @@ class GeminiAnalyzer:
         openai_key_valid = (
             config.openai_api_key and
             not config.openai_api_key.startswith('your_') and
-            len(config.openai_api_key) > 10
+            len(config.openai_api_key) >= 8
         )
 
         if not openai_key_valid:
@@ -622,6 +623,8 @@ class GeminiAnalyzer:
             client_kwargs = {"api_key": config.openai_api_key}
             if config.openai_base_url and config.openai_base_url.startswith('http'):
                 client_kwargs["base_url"] = config.openai_base_url
+            if config.openai_base_url and "aihubmix.com" in config.openai_base_url:
+                client_kwargs["default_headers"] = {"APP-Code": "GPIJ3886"}
 
             self._openai_client = OpenAI(**client_kwargs)
             self._current_model_name = config.openai_model
@@ -800,14 +803,19 @@ class GeminiAnalyzer:
         base_delay = config.gemini_retry_delay
 
         def _build_base_request_kwargs() -> dict:
+            # OpenAI-compatible path (DeepSeek, Qwen, etc.): add extra_body for thinking models
+            model_name = self._current_model_name
             kwargs = {
-                "model": self._current_model_name,
+                "model": model_name,
                 "messages": [
                     {"role": "system", "content": self.SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": generation_config.get('temperature', config.openai_temperature),
             }
+            payload = get_thinking_extra_body(model_name)
+            if payload:
+                kwargs["extra_body"] = payload
             return kwargs
 
         def _is_unsupported_param_error(error_message: str, param_name: str) -> bool:
@@ -1298,7 +1306,17 @@ class GeminiAnalyzer:
 ## ✅ 分析任务
 
 请为 **{stock_name}({code})** 生成【决策仪表盘】，严格按照 JSON 格式输出。
+"""
+        if context.get('is_index_etf'):
+            prompt += """
+> ⚠️ **指数/ETF 分析约束**：该标的为指数跟踪型 ETF 或市场指数。
+> - 风险分析仅关注：**指数走势、跟踪误差、市场流动性**
+> - 严禁将基金公司的诉讼、声誉、高管变动纳入风险警报
+> - 业绩预期基于**指数成分股整体表现**，而非基金公司财报
+> - `risk_alerts` 中不得出现基金管理人相关的公司经营风险
 
+"""
+        prompt += f"""
 ### ⚠️ 重要：股票名称确认
 如果上方显示的股票名称为"股票{code}"或不正确，请在分析开头**明确输出该股票的正确中文全称**。
 
